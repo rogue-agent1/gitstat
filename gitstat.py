@@ -1,257 +1,199 @@
 #!/usr/bin/env python3
-"""gitstat — Quick git repository health overview.
+"""gitstat - git repository statistics (commits, authors, files, activity, churn)."""
 
-Usage:
-    gitstat [PATH...] [--json] [--recursive] [--depth N]
+import argparse, subprocess, sys, os, re, time
+from collections import Counter, defaultdict
+from datetime import datetime
 
-Examples:
-    gitstat .
-    gitstat ~/projects --recursive
-    gitstat repo1 repo2 --json
-"""
+def git(args, repo="."):
+    r = subprocess.run(["git"] + args, capture_output=True, text=True, cwd=repo)
+    return r.stdout.strip()
 
-import argparse
-import json
-import os
-import subprocess
-import sys
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
-from pathlib import Path
-
-
-@dataclass
-class RepoStat:
-    path: str = ""
-    branch: str = ""
-    ahead: int = 0
-    behind: int = 0
-    staged: int = 0
-    modified: int = 0
-    untracked: int = 0
-    stashes: int = 0
-    last_commit_date: str = ""
-    last_commit_msg: str = ""
-    last_commit_age: str = ""
-    total_commits: int = 0
-    contributors: int = 0
-    branches_local: int = 0
-    branches_stale: list = field(default_factory=list)  # branches with no activity >30d
-    remotes: list = field(default_factory=list)
-    dirty: bool = False
-    warnings: list = field(default_factory=list)
-
-
-def run_git(repo_path: str, *args) -> str:
-    """Run a git command and return stdout."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", repo_path] + list(args),
-            capture_output=True, text=True, timeout=10
-        )
-        return result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return ""
-
-
-def get_repo_stat(repo_path: str) -> RepoStat:
-    """Gather stats for a single git repo."""
-    stat = RepoStat(path=str(repo_path))
+def cmd_summary(args):
+    repo = args.repo
+    print(f"\n  Git Summary: {os.path.basename(os.path.abspath(repo))}")
+    print("  " + "─" * 45)
 
     # Branch
-    stat.branch = run_git(repo_path, "branch", "--show-current") or run_git(repo_path, "rev-parse", "--short", "HEAD")
+    branch = git(["rev-parse", "--abbrev-ref", "HEAD"], repo)
+    total = int(git(["rev-list", "--count", "HEAD"], repo) or 0)
+    first = git(["log", "--reverse", "--format=%ai", "-1"], repo)
+    latest = git(["log", "--format=%ai", "-1"], repo)
+    remotes = git(["remote", "-v"], repo)
 
-    # Ahead/behind
-    upstream = run_git(repo_path, "rev-parse", "--abbrev-ref", f"{stat.branch}@{{upstream}}")
-    if upstream:
-        ab = run_git(repo_path, "rev-list", "--left-right", "--count", f"{stat.branch}...{upstream}")
-        if ab and "\t" in ab:
-            parts = ab.split("\t")
-            stat.ahead = int(parts[0])
-            stat.behind = int(parts[1])
+    print(f"  Branch:       {branch}")
+    print(f"  Commits:      {total}")
+    print(f"  First commit: {first[:10] if first else '?'}")
+    print(f"  Last commit:  {latest[:10] if latest else '?'}")
 
-    # Status
-    status = run_git(repo_path, "status", "--porcelain")
-    if status:
-        for line in status.split("\n"):
-            if not line:
-                continue
-            idx, wt = line[0], line[1]
-            if idx in "MADRC":
-                stat.staged += 1
-            if wt in "MD":
-                stat.modified += 1
-            if line.startswith("??"):
-                stat.untracked += 1
+    # Authors
+    authors = git(["shortlog", "-sn", "--no-merges", "HEAD"], repo)
+    author_list = []
+    for line in authors.splitlines():
+        m = re.match(r'\s*(\d+)\s+(.*)', line)
+        if m:
+            author_list.append((int(m.group(1)), m.group(2)))
+    print(f"  Authors:      {len(author_list)}")
 
-    stat.dirty = (stat.staged + stat.modified + stat.untracked) > 0
+    # Files
+    files = git(["ls-files"], repo).splitlines()
+    print(f"  Files:        {len(files)}")
 
-    # Stashes
-    stash_list = run_git(repo_path, "stash", "list")
-    stat.stashes = len(stash_list.split("\n")) if stash_list else 0
+    # Extensions
+    exts = Counter()
+    for f in files:
+        _, ext = os.path.splitext(f)
+        exts[ext or "(none)"] += 1
+    print(f"\n  Top file types:")
+    for ext, cnt in exts.most_common(8):
+        print(f"    {ext:<12} {cnt:>5}")
 
-    # Last commit
-    log = run_git(repo_path, "log", "-1", "--format=%aI|%s")
-    if log and "|" in log:
-        date_str, msg = log.split("|", 1)
-        stat.last_commit_date = date_str
-        stat.last_commit_msg = msg[:80]
+    # Top authors
+    if author_list:
+        print(f"\n  Top authors:")
+        for cnt, name in author_list[:8]:
+            pct = cnt * 100 / total if total else 0
+            bar = "█" * int(pct / 3) + "░" * (20 - int(pct / 3))
+            print(f"    {name:<25} {cnt:>5} ({pct:>4.1f}%) {bar}")
+    print()
+
+def cmd_activity(args):
+    repo = args.repo
+    days = args.days
+    since = f"--since={days} days ago" if days else ""
+    log_args = ["log", "--format=%ai", "--no-merges"]
+    if since:
+        log_args.append(since)
+    raw = git(log_args, repo)
+    if not raw:
+        print("  No commits found")
+        return
+
+    by_hour = Counter()
+    by_dow = Counter()
+    by_date = Counter()
+    dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    for line in raw.splitlines():
         try:
-            dt = datetime.fromisoformat(date_str)
-            now = datetime.now(timezone.utc)
-            delta = now - dt.astimezone(timezone.utc)
-            if delta.days > 0:
-                stat.last_commit_age = f"{delta.days}d ago"
-            elif delta.seconds > 3600:
-                stat.last_commit_age = f"{delta.seconds // 3600}h ago"
-            else:
-                stat.last_commit_age = f"{delta.seconds // 60}m ago"
-        except (ValueError, TypeError):
+            dt = datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+            by_hour[dt.hour] += 1
+            by_dow[dt.weekday()] += 1
+            by_date[dt.strftime("%Y-%m-%d")] += 1
+        except ValueError:
             pass
 
-    # Total commits
-    count = run_git(repo_path, "rev-list", "--count", "HEAD")
-    stat.total_commits = int(count) if count.isdigit() else 0
+    total = sum(by_hour.values())
+    period = f"last {days} days" if days else "all time"
+    print(f"\n  Activity ({period}, {total} commits)")
+    print("  " + "─" * 45)
 
-    # Contributors
-    shortlog = run_git(repo_path, "shortlog", "-sn", "--all")
-    stat.contributors = len([l for l in shortlog.split("\n") if l.strip()]) if shortlog else 0
+    # By hour
+    print(f"\n  By hour:")
+    mx = max(by_hour.values()) if by_hour else 1
+    for h in range(24):
+        c = by_hour.get(h, 0)
+        bar = "█" * int(c * 30 / mx) if mx else ""
+        print(f"    {h:02d}:00  {bar} {c}")
 
-    # Branches
-    branches = run_git(repo_path, "branch", "--format=%(refname:short)")
-    branch_list = [b.strip() for b in branches.split("\n") if b.strip()] if branches else []
-    stat.branches_local = len(branch_list)
+    # By day of week
+    print(f"\n  By day:")
+    mx = max(by_dow.values()) if by_dow else 1
+    for d in range(7):
+        c = by_dow.get(d, 0)
+        bar = "█" * int(c * 20 / mx) if mx else ""
+        print(f"    {dow_names[d]}  {bar} {c}")
 
-    # Stale branches (>30 days no activity)
-    for b in branch_list:
-        if b == stat.branch:
-            continue
-        last = run_git(repo_path, "log", "-1", "--format=%aI", b)
-        if last:
-            try:
-                dt = datetime.fromisoformat(last)
-                delta = datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
-                if delta.days > 30:
-                    stat.branches_stale.append(f"{b} ({delta.days}d)")
-            except (ValueError, TypeError):
-                pass
+    # Most active days
+    if by_date:
+        print(f"\n  Most active days:")
+        for date, cnt in by_date.most_common(5):
+            print(f"    {date}  {cnt} commits")
+    print()
 
-    # Remotes
-    remotes = run_git(repo_path, "remote", "-v")
-    seen = set()
-    for line in remotes.split("\n"):
-        if line and "(fetch)" in line:
-            parts = line.split()
-            if len(parts) >= 2 and parts[0] not in seen:
-                seen.add(parts[0])
-                stat.remotes.append(parts[0])
+def cmd_churn(args):
+    repo = args.repo
+    n = args.top
+    log = git(["log", "--format=", "--numstat", "--no-merges", "-200"], repo)
+    file_churn = defaultdict(lambda: {"add": 0, "del": 0, "commits": 0})
+    seen_files = set()
 
-    # Warnings
-    if stat.ahead > 0:
-        stat.warnings.append(f"⬆ {stat.ahead} unpushed commit(s)")
-    if stat.behind > 0:
-        stat.warnings.append(f"⬇ {stat.behind} commits behind upstream")
-    if stat.stashes > 0:
-        stat.warnings.append(f"📦 {stat.stashes} stash(es)")
-    if stat.branches_stale:
-        stat.warnings.append(f"🪵 {len(stat.branches_stale)} stale branch(es)")
-    if stat.dirty:
-        stat.warnings.append("⚠ Uncommitted changes")
+    for line in log.splitlines():
+        parts = line.split('\t')
+        if len(parts) == 3:
+            add, delete, path = parts
+            if add == '-' or delete == '-':
+                continue
+            file_churn[path]["add"] += int(add)
+            file_churn[path]["del"] += int(delete)
+            if path not in seen_files:
+                file_churn[path]["commits"] += 1
 
-    return stat
+    if not file_churn:
+        print("  No churn data")
+        return
 
+    # Sort by total changes
+    ranked = sorted(file_churn.items(), key=lambda x: x[1]["add"] + x[1]["del"], reverse=True)
 
-def find_repos(paths: list[str], recursive: bool = False, depth: int = 2) -> list[str]:
-    """Find git repos in given paths."""
-    repos = []
-    for p in paths:
-        path = Path(p).resolve()
-        if (path / ".git").exists():
-            repos.append(str(path))
-        elif recursive:
-            for root, dirs, files in os.walk(path):
-                rel_depth = str(root).count(os.sep) - str(path).count(os.sep)
-                if rel_depth >= depth:
-                    dirs.clear()
-                    continue
-                if ".git" in dirs:
-                    repos.append(root)
-                    dirs.remove(".git")
-    return sorted(repos)
+    print(f"\n  File Churn (top {n}, last 200 commits)")
+    print("  " + "─" * 60)
+    print(f"  {'FILE':<40} {'ADDED':>7} {'DELETED':>7} {'TOTAL':>7}")
+    for path, stats in ranked[:n]:
+        total = stats["add"] + stats["del"]
+        name = path if len(path) <= 39 else "…" + path[-38:]
+        print(f"  {name:<40} {'+' + str(stats['add']):>7} {'-' + str(stats['del']):>7} {total:>7}")
+    print()
 
+def cmd_blame(args):
+    repo = args.repo
+    f = args.file
+    raw = git(["blame", "--line-porcelain", f], repo)
+    if not raw:
+        print(f"  Cannot blame {f}")
+        return
+    authors = Counter()
+    for line in raw.splitlines():
+        if line.startswith("author "):
+            authors[line[7:]] += 1
 
-# Colors
-BOLD = "\033[1m"
-DIM = "\033[2m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-RED = "\033[31m"
-CYAN = "\033[36m"
-RESET = "\033[0m"
-
-
-def format_text(stats: list[RepoStat]) -> str:
-    lines = []
-    for s in stats:
-        name = Path(s.path).name
-        status_color = RED if s.dirty else GREEN
-        status_icon = "●" if s.dirty else "○"
-
-        lines.append(f"{BOLD}{name}{RESET}  {status_color}{status_icon}{RESET}  {DIM}{s.branch}{RESET}")
-
-        detail = []
-        if s.staged:
-            detail.append(f"{GREEN}+{s.staged} staged{RESET}")
-        if s.modified:
-            detail.append(f"{YELLOW}~{s.modified} modified{RESET}")
-        if s.untracked:
-            detail.append(f"{RED}?{s.untracked} untracked{RESET}")
-        if s.ahead:
-            detail.append(f"{CYAN}↑{s.ahead}{RESET}")
-        if s.behind:
-            detail.append(f"{YELLOW}↓{s.behind}{RESET}")
-
-        if detail:
-            lines.append(f"  {' '.join(detail)}")
-
-        lines.append(f"  {DIM}{s.total_commits} commits · {s.last_commit_age} · {s.last_commit_msg}{RESET}")
-
-        for w in s.warnings:
-            lines.append(f"  {YELLOW}{w}{RESET}")
-
-        lines.append("")
-
-    # Summary
-    total = len(stats)
-    dirty = sum(1 for s in stats if s.dirty)
-    clean = total - dirty
-    lines.append(f"{DIM}{'─' * 40}{RESET}")
-    lines.append(f"{total} repos: {GREEN}{clean} clean{RESET}, {RED}{dirty} dirty{RESET}")
-
-    return "\n".join(lines)
-
+    total = sum(authors.values())
+    print(f"\n  Blame: {f} ({total} lines)")
+    print("  " + "─" * 45)
+    for name, cnt in authors.most_common(10):
+        pct = cnt * 100 / total
+        bar = "█" * int(pct / 3)
+        print(f"    {name:<25} {cnt:>5} ({pct:>4.1f}%) {bar}")
+    print()
 
 def main():
-    parser = argparse.ArgumentParser(prog="gitstat", description="Quick git repo health overview")
-    parser.add_argument("paths", nargs="*", default=["."], help="Paths to check")
-    parser.add_argument("--recursive", "-r", action="store_true", help="Find repos recursively")
-    parser.add_argument("--depth", "-d", type=int, default=2, help="Max recursion depth")
-    parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    p = argparse.ArgumentParser(description="Git repository statistics")
+    sp = p.add_subparsers(dest="cmd")
 
-    args = parser.parse_args()
+    s = sp.add_parser("summary", help="Repository summary")
+    s.add_argument("repo", nargs="?", default=".")
+    s.set_defaults(func=cmd_summary)
 
-    repos = find_repos(args.paths, args.recursive, args.depth)
-    if not repos:
-        print("No git repositories found.", file=sys.stderr)
+    a = sp.add_parser("activity", help="Commit activity patterns")
+    a.add_argument("repo", nargs="?", default=".")
+    a.add_argument("-d", "--days", type=int, help="Last N days")
+    a.set_defaults(func=cmd_activity)
+
+    c = sp.add_parser("churn", help="File churn analysis")
+    c.add_argument("repo", nargs="?", default=".")
+    c.add_argument("-n", "--top", type=int, default=15)
+    c.set_defaults(func=cmd_churn)
+
+    b = sp.add_parser("blame", help="Blame summary for a file")
+    b.add_argument("file")
+    b.add_argument("--repo", default=".")
+    b.set_defaults(func=cmd_blame)
+
+    args = p.parse_args()
+    if not args.cmd:
+        p.print_help()
         sys.exit(1)
-
-    stats = [get_repo_stat(r) for r in repos]
-
-    if args.json:
-        print(json.dumps([asdict(s) for s in stats], indent=2))
-    else:
-        print(format_text(stats))
-
+    args.func(args)
 
 if __name__ == "__main__":
     main()
